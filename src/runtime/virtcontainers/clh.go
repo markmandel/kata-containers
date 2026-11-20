@@ -2164,6 +2164,13 @@ func (clh *cloudHypervisor) addNet(e Endpoint) error {
 
 	net := chclient.NewNetConfig()
 	net.Mac = &mac
+	// Deterministic IDs (rather than CH's generated ones), so a live-migration destination can
+	// name the source's NICs when it supplies its own tap FDs for them.
+	if clh.netDevices != nil {
+		net.SetId(fmt.Sprintf("katanet%d", len(*clh.netDevices)))
+	} else {
+		net.SetId("katanet0")
+	}
 	if netRateLimiterConfig != nil {
 		net.SetRateLimiterConfig(*netRateLimiterConfig)
 	}

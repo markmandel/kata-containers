@@ -20,20 +20,28 @@
 package virtcontainers
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httputil"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
-	chclient "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/cloud-hypervisor/client"
 	"github.com/sirupsen/logrus"
 )
 
@@ -202,7 +210,7 @@ func (s *Sandbox) completeReceive(ctx context.Context) (err error) {
 	if !ok {
 		return fmt.Errorf("migration receive needs cloud-hypervisor")
 	}
-	if err = clh.receiveMigration(ctx, m.url, m.srcSandbox, s.network.Endpoints()); err != nil {
+	if err = clh.receiveMigration(ctx, m.url, m.srcSandbox); err != nil {
 		return err
 	}
 
@@ -226,9 +234,9 @@ func (s *Sandbox) completeReceive(ctx context.Context) (err error) {
 	return nil
 }
 
-// receiveMigration receives the VM into the already-launched (but not booted) CH, then hot-adds
-// this pod's NIC, which was cold-attached to clh.netDevices before start but never sent to CH.
-func (clh *cloudHypervisor) receiveMigration(ctx context.Context, url, srcSandbox string, endpoints []Endpoint) error {
+// receiveMigration receives the VM into the already-launched (but not booted) CH. Its NICs arrive
+// with the VM and are re-backed by this pod's taps (cold-attached to clh.netDevices before start).
+func (clh *cloudHypervisor) receiveMigration(ctx context.Context, url, srcSandbox string) error {
 	ownVfsd, err := clh.virtioFsSocketPath(clh.id)
 	if err != nil {
 		return err
@@ -252,10 +260,6 @@ func (clh *cloudHypervisor) receiveMigration(ctx context.Context, url, srcSandbo
 		}
 	}
 
-	api, ok := clh.client().(*clhClientApi)
-	if !ok {
-		return fmt.Errorf("unexpected cloud-hypervisor client type %T", clh.client())
-	}
 	// Bound the wait: it blocks every other call on the sandbox (including deletion), since
 	// sandbox operations are serialized, and containerd gives the shim's CreateContainer call no
 	// deadline. The sender is expected to start soon after the placeholder is waiting.
@@ -263,9 +267,8 @@ func (clh *cloudHypervisor) receiveMigration(ctx context.Context, url, srcSandbo
 	migrationLogger().WithField("url", url).Info("waiting to receive migration")
 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
-	if _, err := api.ApiInternal.VmReceiveMigrationPut(ctx).
-		ReceiveMigrationData(*chclient.NewReceiveMigrationData(url)).Execute(); err != nil {
-		return openAPIClientError(err)
+	if err := clh.vmReceiveMigrationWithNetFds(ctx, url); err != nil {
+		return err
 	}
 	info, err := clh.vmInfo()
 	if err != nil {
@@ -282,22 +285,67 @@ func (clh *cloudHypervisor) receiveMigration(ctx context.Context, url, srcSandbo
 			return err
 		}
 	}
+	return nil
+}
 
-	pciInfo, err := clh.vmAddNetPut()
+// vmReceiveMigrationWithNetFds calls vm.receive-migration, passing this pod's tap FDs for each NIC
+// (by the deterministic IDs addNet gives them on both pods) so the migrated NICs are re-backed by
+// this pod's network instead of the source's (needs CH with receive-migration net_fds support).
+// Hand-rolled like vmAddNetPutRequest: the generated client can't send FDs over SCM_RIGHTS.
+func (clh *cloudHypervisor) vmReceiveMigrationWithNetFds(ctx context.Context, url string) error {
+	type restoredNet struct {
+		ID     string `json:"id"`
+		NumFds int    `json:"num_fds"`
+	}
+	body := struct {
+		ReceiverURL string        `json:"receiver_url"`
+		NetFds      []restoredNet `json:"net_fds,omitempty"`
+	}{ReceiverURL: url}
+	var fds []int
+	if clh.netDevices != nil {
+		for _, nd := range *clh.netDevices {
+			files := clh.netDevicesFiles[*nd.Mac]
+			body.NetFds = append(body.NetFds, restoredNet{ID: nd.GetId(), NumFds: len(files)})
+			for _, f := range files {
+				fds = append(fds, int(f.Fd()))
+			}
+		}
+	}
+	payload, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
-	for _, e := range endpoints {
-		for i, netdev := range *clh.netDevices {
-			if e.HardwareAddr() != *netdev.Mac || i >= len(pciInfo) {
-				continue
-			}
-			pciPath, err := clhPciInfoToPath(pciInfo[i])
-			if err != nil {
-				return err
-			}
-			e.SetPciPath(pciPath)
-		}
+
+	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: clh.state.apiSocket, Net: "unix"})
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(deadline)
+	}
+	req, err := http.NewRequest(http.MethodPut, "http://localhost/api/v1/vm.receive-migration", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	// DumpRequest only writes Content-Length from the header (CH rejects a body without it).
+	req.Header.Set("Content-Length", strconv.Itoa(len(payload)))
+	raw, err := httputil.DumpRequest(req, true)
+	if err != nil {
+		return err
+	}
+	if _, _, err := conn.WriteMsgUnix(raw, syscall.UnixRights(fds...), nil); err != nil {
+		return err
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+	if err != nil {
+		return fmt.Errorf("vm.receive-migration: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("vm.receive-migration failed with %d: %s", resp.StatusCode, respBody)
 	}
 	return nil
 }
