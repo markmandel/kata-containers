@@ -228,6 +228,7 @@ func (sandboxConfig *SandboxConfig) valid() bool {
 type Sandbox struct {
 	ctx        context.Context
 	devManager api.DeviceManager
+	migration  *migrationReceive // non-nil in live-migration receive mode
 	factory    Factory
 	hypervisor Hypervisor
 	agent      agent
@@ -689,6 +690,24 @@ func newSandbox(ctx context.Context, sandboxConfig SandboxConfig, factory Factor
 		swapDeviceNum:   0,
 		swapSizeBytes:   0,
 		swapDevices:     []*config.BlockDrive{},
+	}
+
+	// The pod's OCI annotations are on the sandbox container's config (as in
+	// setHypervisorConfigAnnotations), not in sandboxConfig.Annotations.
+	var podAnnotations map[string]string
+	if len(sandboxConfig.Containers) > 0 {
+		podAnnotations = sandboxConfig.Containers[0].Annotations
+	}
+	if s.migration, err = newMigrationReceive(podAnnotations, s.id); err != nil {
+		return nil, err
+	}
+	if s.migration != nil {
+		if clh, ok := s.hypervisor.(*cloudHypervisor); ok {
+			clh.migration = s.migration
+		}
+		if k, ok := s.agent.(*kataAgent); ok {
+			k.migration = s.migration
+		}
 	}
 
 	fsShare, err := NewFilesystemShare(s)
@@ -1725,6 +1744,13 @@ func (s *Sandbox) startVM(ctx context.Context, prestartHookFunc func(context.Con
 		return err
 	}
 
+	// Migration receive mode: CH is launched but not booted. The VM, and with it the agent,
+	// arrives once all containers are created (see completeReceive).
+	if s.migration != nil {
+		s.Logger().Info("migration receive mode: VM will be received after containers are created")
+		return nil
+	}
+
 	if caps.IsNetworkDeviceHotplugSupported() && prestartHookFunc != nil {
 		err = s.runPrestartHooks(ctx, prestartHookFunc)
 		if err != nil {
@@ -1858,6 +1884,13 @@ func (s *Sandbox) CreateContainer(ctx context.Context, contConfig ContainerConfi
 
 	if err = s.storeSandbox(ctx); err != nil {
 		return nil, err
+	}
+
+	// Migration receive mode: once every container's files are shared, receive the VM.
+	if s.migration != nil && !s.migration.received() && s.migration.allCreated() {
+		if err = s.completeReceive(ctx); err != nil {
+			return nil, err
+		}
 	}
 
 	return c, nil
@@ -2206,6 +2239,11 @@ func (s *Sandbox) Start(ctx context.Context) error {
 func (s *Sandbox) Stop(ctx context.Context, force bool) error {
 	span, ctx := katatrace.Trace(ctx, s.Logger(), "Stop", sandboxTracingTags, map[string]string{"sandbox_id": s.id})
 	defer span.End()
+
+	// A placeholder stopped before receiving: release agent requests waiting for the VM.
+	if s.migration != nil {
+		s.migration.abandon()
+	}
 
 	if s.state.State == types.StateStopped {
 		s.Logger().Info("sandbox already stopped")
@@ -2580,6 +2618,10 @@ func (s *Sandbox) hotplugVfioNetworkDevice(ctx context.Context, ep *VfioEndpoint
 func (s *Sandbox) updateResources(ctx context.Context) error {
 	if s == nil {
 		return errors.New("sandbox is nil")
+	}
+	// A received VM keeps the source's size; don't resize it.
+	if s.migration != nil {
+		return nil
 	}
 
 	if s.config == nil {

@@ -314,8 +314,9 @@ type KataAgentState struct {
 
 // nolint: govet
 type kataAgent struct {
-	ctx      context.Context
-	vmSocket interface{}
+	ctx       context.Context
+	vmSocket  interface{}
+	migration *migrationReceive // non-nil in live-migration receive mode
 
 	client *kataclient.AgentClient
 
@@ -1714,6 +1715,12 @@ func (k *kataAgent) createContainer(ctx context.Context, sandbox *Sandbox, c *Co
 		SandboxPidns: sharedPidNs,
 	}
 
+	// Migration receive mode: the container already exists in the incoming VM; its files are
+	// shared above, so just record it.
+	if k.migration != nil {
+		return buildProcessFromExecID(req.ExecId)
+	}
+
 	if _, err = k.sendReq(ctx, req); err != nil {
 		if err.Error() == context.DeadlineExceeded.Error() {
 			return nil, grpcStatus.Errorf(codes.DeadlineExceeded, "CreateContainerRequest timed out")
@@ -2184,6 +2191,11 @@ func (k *kataAgent) startContainer(ctx context.Context, sandbox *Sandbox, c *Con
 	span, ctx := katatrace.Trace(ctx, k.Logger(), "startContainer", kataAgentTracingTags)
 	defer span.End()
 
+	// Migration receive mode: migrated containers are already running.
+	if k.migration != nil {
+		return nil
+	}
+
 	req := &grpc.StartContainerRequest{
 		ContainerId: c.id,
 	}
@@ -2630,6 +2642,27 @@ func (k *kataAgent) getReqContext(ctx context.Context, reqName string) (newCtx c
 
 func (k *kataAgent) sendReq(spanCtx context.Context, request interface{}) (interface{}, error) {
 	start := time.Now()
+
+	// Migration receive mode: there's no agent until the VM arrives. Report healthy to liveness
+	// checks, hold everything else, then address containers by their source IDs. If the receive
+	// failed or was abandoned there's no guest: teardown requests succeed, the rest fail.
+	if k.migration != nil {
+		if _, isCheck := request.(*grpc.CheckRequest); isCheck && !k.migration.received() {
+			return nil, nil
+		}
+		// A kill/remove before the VM arrived means the placeholder is being torn down (the
+		// shim kills containers before Sandbox.Stop): give up on the receive.
+		if isTeardownRequest(request) && !k.migration.received() {
+			k.migration.abandon()
+		}
+		if err := k.migration.waitReceived(spanCtx); err != nil {
+			if isTeardownRequest(request) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		k.migration.translate(request)
+	}
 
 	if err := k.connect(spanCtx); err != nil {
 		return nil, err

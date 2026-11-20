@@ -102,8 +102,11 @@ func createSandboxFromConfig(ctx context.Context, sandboxConfig SandboxConfig, f
 
 	s.postCreatedNetwork(ctx)
 
-	if err = s.getAndStoreGuestDetails(ctx); err != nil {
-		return nil, err
+	// In migration receive mode there's no agent until the VM arrives.
+	if s.migration == nil {
+		if err = s.getAndStoreGuestDetails(ctx); err != nil {
+			return nil, err
+		}
 	}
 
 	// Create Containers

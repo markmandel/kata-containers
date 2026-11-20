@@ -291,6 +291,7 @@ func (s *CloudHypervisorState) reset() {
 }
 
 type cloudHypervisor struct {
+	migration       *migrationReceive // non-nil in live-migration receive mode
 	console         console.Console
 	virtiofsDaemon  VirtiofsDaemon
 	APIClient       clhClient
@@ -927,6 +928,12 @@ func (clh *cloudHypervisor) StartVM(ctx context.Context, timeout int) error {
 	err = clh.launchClh()
 	if err != nil {
 		return fmt.Errorf("failed to launch cloud-hypervisor: %q", err)
+	}
+
+	// Migration receive mode: leave CH without a VM; receiveMigration fills it in later.
+	if clh.migration != nil {
+		clh.state.state = clhReady
+		return nil
 	}
 
 	bootTimeout := clh.getClhAPITimeout()
@@ -1639,6 +1646,10 @@ func (clh *cloudHypervisor) Check() error {
 	// Check is used by the monitor thread(a background thread). If the
 	// monitor thread calls Check() during the Container boot, it will take
 	// longer than usual specially if there is a hot-plug request in progress.
+	// While receiving a migration, CH's API is busy with the receive and won't answer pings.
+	if clh.migration != nil && !clh.migration.received() {
+		return nil
+	}
 	running, err := clh.isClhRunning(10)
 	if !running {
 		return fmt.Errorf("clh is not running: %s", err)

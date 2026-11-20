@@ -10,7 +10,6 @@ package virtcontainers
 import (
 	"context"
 	b64 "encoding/base64"
-	"encoding/hex"
 	"fmt"
 	"io/fs"
 	"os"
@@ -29,7 +28,6 @@ import (
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 )
 
 // Splitting Regex pattern:
@@ -315,16 +313,12 @@ func shareFileName(containerID, source, destination, randHex string, isSandboxSc
 }
 
 func (f *FilesystemShare) ShareFile(ctx context.Context, c *Container, m *Mount) (*SharedFile, error) {
-	randBytes, err := utils.GenerateRandomBytes(8)
-	if err != nil {
-		return nil, err
-	}
-
-	randHex := hex.EncodeToString(randBytes)
+	// Deterministic (not random) so a migration destination can recreate the source's names.
+	randHex := shareFileSuffix(m.Destination)
 	caps := f.sandbox.hypervisor.Capabilities(ctx)
 	mustCopyEmptyDir := !caps.IsFsSharingSupported() && IsDiskEmptyDir(m.Source)
 
-	filename := shareFileName(c.id, m.Source, m.Destination, randHex, mustCopyEmptyDir)
+	filename := shareFileName(shareID(c), m.Source, m.Destination, randHex, mustCopyEmptyDir)
 	var guestPath string
 
 	// copy file to container's rootfs if filesystem sharing is not supported, otherwise
@@ -702,7 +696,7 @@ func (f *FilesystemShare) ShareRootFilesystem(ctx context.Context, c *Container)
 		return f.shareRootFilesystemWithErofs(ctx, c)
 	}
 
-	rootfsGuestPath := filepath.Join(kataGuestSharedDir(), c.id, c.rootfsSuffix)
+	rootfsGuestPath := filepath.Join(kataGuestSharedDir(), shareID(c), c.rootfsSuffix)
 
 	if HasOptionPrefix(c.rootFs.Options, annotations.FileSystemLayer) {
 		path := filepath.Join("/run/kata-containers", c.id, "rootfs")
@@ -784,7 +778,7 @@ func (f *FilesystemShare) ShareRootFilesystem(ctx context.Context, c *Container)
 	// With virtiofs/9pfs we don't need to ask the agent to mount the rootfs as the shared directory
 	// (kataGuestSharedDir) is already mounted in the guest. We only need to mount the rootfs from
 	// the host and it will show up in the guest.
-	if err := bindMountContainerRootfs(ctx, getMountPath(f.sandbox.ID()), c.id, c.rootFs.Target, false); err != nil {
+	if err := bindMountContainerRootfs(ctx, getMountPath(f.sandbox.ID()), shareID(c), c.rootFs.Target, false); err != nil {
 		return nil, err
 	}
 
@@ -800,13 +794,13 @@ func (f *FilesystemShare) UnshareRootFilesystem(ctx context.Context, c *Containe
 			f.Logger().WithError(err2).Error("rollback failed nydusContainerCleanup")
 		}
 	} else {
-		if err := bindUnmountContainerRootfs(ctx, getMountPath(f.sandbox.ID()), c.id); err != nil {
+		if err := bindUnmountContainerRootfs(ctx, getMountPath(f.sandbox.ID()), shareID(c)); err != nil {
 			return err
 		}
 	}
 
 	// Remove the shared directory for this container.
-	shareDir := filepath.Join(getMountPath(f.sandbox.ID()), c.id)
+	shareDir := filepath.Join(getMountPath(f.sandbox.ID()), shareID(c))
 	if err := syscall.Rmdir(shareDir); err != nil {
 		f.Logger().WithError(err).WithField("share-dir", shareDir).Warn("Could not remove container share dir")
 	}
