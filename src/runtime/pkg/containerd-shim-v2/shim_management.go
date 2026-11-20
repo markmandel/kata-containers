@@ -107,6 +107,37 @@ func (s *service) agentURL(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, url)
 }
 
+// MigrateURL live-migrates this sandbox's VM: POST /migrate?dest=<host:port> (experimental).
+const MigrateURL = "/migrate"
+
+// migrateHandler sends the sandbox's VM to a receiving placeholder pod and returns once the
+// migration has finished (200) or failed (500, the VM keeps running here).
+func (s *service) migrateHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	dest := r.URL.Query().Get("dest")
+	if dest == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte("dest=<host:port> is required"))
+		return
+	}
+	sandbox, ok := s.sandbox.(*vc.Sandbox)
+	if !ok {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("unsupported sandbox type"))
+		return
+	}
+	// Not the request context: a disconnecting client mustn't cancel a migration in flight.
+	if err := sandbox.MigrateOut(context.Background(), dest, 10*time.Minute); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(err.Error()))
+		return
+	}
+	fmt.Fprintln(w, "migrated")
+}
+
 // serveMetrics handle /metrics requests
 func (s *service) serveMetrics(w http.ResponseWriter, r *http.Request) {
 
@@ -340,6 +371,7 @@ func (s *service) startManagementServer(ctx context.Context, ociSpec *specs.Spec
 	m.Handle(IPTablesURL, http.HandlerFunc(s.ipTablesHandler))
 	m.Handle(PolicyURL, http.HandlerFunc(s.policyHandler))
 	m.Handle(IP6TablesURL, http.HandlerFunc(s.ip6TablesHandler))
+	m.Handle(MigrateURL, http.HandlerFunc(s.migrateHandler))
 	s.mountPprofHandle(m, ociSpec)
 
 	// register shim metrics

@@ -226,14 +226,15 @@ func (sandboxConfig *SandboxConfig) valid() bool {
 // Sandbox is composed of a set of containers and a runtime environment.
 // A Sandbox can be created, deleted, started, paused, stopped, listed, entered, and restored.
 type Sandbox struct {
-	ctx        context.Context
-	devManager api.DeviceManager
-	migration  *migrationReceive // non-nil in live-migration receive mode
-	factory    Factory
-	hypervisor Hypervisor
-	agent      agent
-	store      persistapi.PersistDriver
-	fsShare    FilesystemSharer
+	ctx          context.Context
+	devManager   api.DeviceManager
+	migration    *migrationReceive // non-nil in live-migration receive mode
+	migrationOut *migrationSend    // live-migration send state (always set)
+	factory      Factory
+	hypervisor   Hypervisor
+	agent        agent
+	store        persistapi.PersistDriver
+	fsShare      FilesystemSharer
 
 	swapDevices    []*config.BlockDrive
 	volumes        []types.Volume
@@ -708,6 +709,13 @@ func newSandbox(ctx context.Context, sandboxConfig SandboxConfig, factory Factor
 		if k, ok := s.agent.(*kataAgent); ok {
 			k.migration = s.migration
 		}
+	}
+	s.migrationOut = newMigrationSend()
+	if clh, ok := s.hypervisor.(*cloudHypervisor); ok {
+		clh.migrationOut = s.migrationOut
+	}
+	if k, ok := s.agent.(*kataAgent); ok {
+		k.migrationOut = s.migrationOut
 	}
 
 	fsShare, err := NewFilesystemShare(s)
@@ -2244,6 +2252,8 @@ func (s *Sandbox) Stop(ctx context.Context, force bool) error {
 	if s.migration != nil {
 		s.migration.abandon()
 	}
+	// A source whose VM migrated away: release container waits held since the migration.
+	s.migrationOut.beginTeardown()
 
 	if s.state.State == types.StateStopped {
 		s.Logger().Info("sandbox already stopped")

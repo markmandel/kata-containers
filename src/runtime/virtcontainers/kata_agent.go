@@ -314,9 +314,10 @@ type KataAgentState struct {
 
 // nolint: govet
 type kataAgent struct {
-	ctx       context.Context
-	vmSocket  interface{}
-	migration *migrationReceive // non-nil in live-migration receive mode
+	ctx          context.Context
+	vmSocket     interface{}
+	migration    *migrationReceive // non-nil in live-migration receive mode
+	migrationOut *migrationSend    // live-migration send state
 
 	client *kataclient.AgentClient
 
@@ -2663,6 +2664,10 @@ func (k *kataAgent) sendReq(spanCtx context.Context, request interface{}) (inter
 		}
 		k.migration.translate(request)
 	}
+	// Live-migration send: the VM is leaving or has left (see migration_out.go).
+	if handled, err := k.migrationOut.gate(spanCtx, request); handled {
+		return nil, err
+	}
 
 	if err := k.connect(spanCtx); err != nil {
 		return nil, err
@@ -2703,7 +2708,8 @@ func (k *kataAgent) sendReq(spanCtx context.Context, request interface{}) (inter
 	defer func() {
 		agentRPCDurationsHistogram.WithLabelValues(msgName).Observe(float64(time.Since(start).Nanoseconds() / int64(time.Millisecond)))
 	}()
-	return handler(ctx, request)
+	resp, err := handler(ctx, request)
+	return resp, k.migrationOut.afterFailure(spanCtx, request, err)
 }
 
 // readStdout and readStderr are special that we cannot differentiate them with the request types...

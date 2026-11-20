@@ -292,6 +292,7 @@ func (s *CloudHypervisorState) reset() {
 
 type cloudHypervisor struct {
 	migration       *migrationReceive // non-nil in live-migration receive mode
+	migrationOut    *migrationSend    // live-migration send state
 	console         console.Console
 	virtiofsDaemon  VirtiofsDaemon
 	APIClient       clhClient
@@ -418,6 +419,11 @@ func (clh *cloudHypervisor) setupVirtiofsDaemon(ctx context.Context) error {
 	}
 
 	pid, err := clh.virtiofsDaemon.Start(ctx, func() {
+		// virtiofsd exits when the VM it served is live-migrated away; that's not a failure.
+		if clh.migrationOut.active() {
+			clh.Logger().Info("virtiofsd exited during/after live migration; not stopping the VM")
+			return
+		}
 		clh.StopVM(ctx, false)
 	})
 	if err != nil {
@@ -1650,6 +1656,10 @@ func (clh *cloudHypervisor) Check() error {
 	if clh.migration != nil && !clh.migration.received() {
 		return nil
 	}
+	// While sending a migration CH is busy, and afterwards it has exited with the VM gone.
+	if clh.migrationOut.active() {
+		return nil
+	}
 	running, err := clh.isClhRunning(10)
 	if !running {
 		return fmt.Errorf("clh is not running: %s", err)
@@ -1826,6 +1836,8 @@ func (clh *cloudHypervisor) launchClh() error {
 	}
 
 	args := []string{cscAPIsocket, clh.state.apiSocket}
+	// CH's event log tells a live-migration sender whether the migration finished or failed.
+	args = append(args, "--event-monitor", "path="+filepath.Join(clh.config.VMStorePath, clh.id, clhEventsFile))
 	if clh.config.Debug && clh.config.HypervisorLoglevel > 0 {
 		// Cloud hypervisor log levels
 		// 'v' occurrences increase the level
