@@ -290,22 +290,29 @@ func (clh *cloudHypervisor) receiveMigration(ctx context.Context, url, srcSandbo
 
 // vmReceiveMigrationWithNetFds calls vm.receive-migration, passing this pod's tap FDs for each NIC
 // (by the deterministic IDs addNet gives them on both pods) so the migrated NICs are re-backed by
-// this pod's network instead of the source's (needs CH with receive-migration net_fds support).
-// Hand-rolled like vmAddNetPutRequest: the generated client can't send FDs over SCM_RIGHTS.
+// this pod's network instead of the source's (needs CH >= v55.0 for receive-migration
+// external_fds). Hand-rolled like vmAddNetPutRequest: the generated client can't send FDs over
+// SCM_RIGHTS.
 func (clh *cloudHypervisor) vmReceiveMigrationWithNetFds(ctx context.Context, url string) error {
-	type restoredNet struct {
-		ID     string `json:"id"`
-		NumFds int    `json:"num_fds"`
+	type netTarget struct {
+		ID string `json:"id"`
+	}
+	type externalFd struct {
+		Target      map[string]netTarget `json:"target"`
+		ExpectedFds int                  `json:"expected_fds"`
 	}
 	body := struct {
-		ReceiverURL string        `json:"receiver_url"`
-		NetFds      []restoredNet `json:"net_fds,omitempty"`
+		ReceiverURL string       `json:"receiver_url"`
+		ExternalFds []externalFd `json:"external_fds,omitempty"`
 	}{ReceiverURL: url}
 	var fds []int
 	if clh.netDevices != nil {
 		for _, nd := range *clh.netDevices {
 			files := clh.netDevicesFiles[*nd.Mac]
-			body.NetFds = append(body.NetFds, restoredNet{ID: nd.GetId(), NumFds: len(files)})
+			body.ExternalFds = append(body.ExternalFds, externalFd{
+				Target:      map[string]netTarget{"Net": {ID: nd.GetId()}},
+				ExpectedFds: len(files),
+			})
 			for _, f := range files {
 				fds = append(fds, int(f.Fd()))
 			}
